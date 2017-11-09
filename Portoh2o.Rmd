@@ -1,0 +1,361 @@
+
+---
+title: "Porto Seguro's Safe Driver Prediction using H20"
+author: "Prepared by : kimnewzealand"
+date: "Date : 9 November 2017"
+output:
+  html_notebook
+---
+
+## Background
+
+In this Kaggle competition, [Porto Seguro Safe Driver Prediction](https://www.kaggle.com/c/porto-seguro-safe-driver-prediction), we are looking to predict the probability that an auto insurance policy holder files a claim. 
+
+The goal is to benchmark model training with   [h2o](https://h2o-release.s3.amazonaws.com/h2o/rel-turan/4/docs-website/h2o-docs/booklets/R_Vignette.pdf) using system.time().
+
+Note the emphasis here will not be on achieving the best score in the Kaggle leaderboard, although a submission will be made to assess the model's Normalised Gini coefficient for further model selection, feature engineering and parameter tuning. 
+
+* * *
+
+### Setup
+
+**LOAD PACKAGES**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, messages=FALSE}
+library(data.table)
+library(knitr)
+library(tidyverse)
+library(stringr)
+library(car)
+library(anchors)
+library(GGally)
+library(h2o)
+```
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+## Load Data
+
+The first step will be to load the test data file and train data file. These have been downloaded to a local Kaggle folder offline and unzipped from the 7z file format using winzip.
+
+We will use the [data.table](https://cran.r-project.org/web/packages/data.table/index.html) R package designed for working with large datasets.
+
+```{r loaddata,messages=FALSE}
+## Using fread from data.table package to load the data
+setwd("~/Kaggle/Porto")
+train <- fread("./train.csv",colClasses = "numeric",verbose = FALSE )
+test <- fread("./test.csv",colClasses = "numeric",verbose=FALSE)
+```
+
+In the dataset with `r dim(train)[1]` rows and `r dim(train)[2]` columns each row corresponds to a policy holder, and the _target_ column reflects that a claim was filed (1) or not (0).
+
+_The following information is available from the Kaggle discussion forum: _ 
+
+Features that belong to similar groupings are tagged as such in the feature names.
+
+-"ind" is related to individual or driver,   
+-"reg" is related to quality of life in a certain region,  
+-"car" is related to car itself,  
+-"calc" is an calculated feature.
+
+In addition, feature names include the postfix _bin_ to indicate binary features and _cat_ to indicate categorical features. 
+
+Features without these designations are either continuous or ordinal. 
+
+Values of -1 indicate that the feature was missing from the observation. 
+
+
+* * *
+### Part 1: EDA
+
+See separate R Notebook, PortoEDA.Rmd
+
+### Part 2: Data Cleaning
+
+Let's briefly clean the train and test datasets.
+
+2.1 Remove train IDs
+
+Remove ID feature from train as this identifier is not needed in the algorithms.
+```{r removeid}
+# Remove ID feature using select function from dplyr
+train <- train %>% dplyr::select(-id)
+```
+
+2.2 Missing Values
+
+Next we will extract and view the variables that have value -1, which represent the missing values in the dataset. If we left these values they would either distort or interrupt the modelling and we will make an assumption that some models may not handle NA values.
+
+With dplyr we can call functions from different R packages directly inside the dplyr functions. We will use the [stringr](https://cran.r-project.org/web/packages/stringr/vignettes/stringr.html) R package with dplyr to view a summary of the -1's. Then we will then use the [anchors](https://cran.r-project.org/web/packages/anchors/index.html) R package with the replace.value function to impute the -1's with the column means.
+
+```{r recode,warnings=FALSE}
+# Use the base summary function for result summaries not dplyr. This will provide us with the ranges of the variables including the minimums
+s <- summary(train)  
+#  Extract and view the min values that have -1 from the summary we just created use str_detect from stringr package. 
+s %>% 
+      data.frame() %>% 
+      filter(str_detect(Freq,"-1")) %>% 
+      filter(str_detect(Freq,"Min")) %>%
+      dplyr::select(-1)
+
+# Replace the -1 ie missing values in with NAs 
+# Find the index of the columns names that contain cat
+indx <- grepl('cat', colnames(train))
+# First convert the categorical columnds to NA
+train <- replace.value( train, colnames(train)[indx], from=-1, to=NA, verbose = FALSE)
+
+# Next convert the numerical columns to NA
+train <- replace.value( train, colnames(train)[-indx], from=-1, to=NA, verbose = FALSE)
+
+# Sanity check that we have cleaned up all -1's, the result should be empty
+colsum <- colSums(train=="-1",na.rm = TRUE) 
+colsum[colsum>0]
+```
+
+```{r testsummary}
+s_test <- summary(test)  
+#  Extract and view the min values that have -1 from the summary we just created use str_detect from stringr package. 
+s_test %>% 
+      data.frame() %>% 
+      filter(str_detect(Freq,"-1")) %>% 
+      filter(str_detect(Freq,"Min")) %>%
+      dplyr::select(-1)
+
+# Replace the -1 ie missing values in with NAs 
+# Find the index of the columns names that contain cat
+indx <- grepl('cat', colnames(test))
+# First convert the categorical columnds to NA
+test <- replace.value( test, colnames(test)[indx], from=-1, to=NA, verbose = FALSE)
+
+# Next convert the numerical columns to NA
+test <- replace.value( test, colnames(test)[-indx], from=-1, to=NA, verbose = FALSE)
+
+# Sanity check that we have cleaned up all -1's, the result should be empty
+colsum <- colSums(test=="-1",na.rm=TRUE) 
+colsum[colsum>0]
+```
+
+
+* * *
+
+## Part 3: Modeling
+
+3.1. **MODEL SELECTION**
+
+Since we know the outcome categorical variable, we will use a supervised machine learning algorithm. It also appears from our EDA that we will potentially need a non-linear classification model.  We will use GLM, Random Forest, GBM and Deep Learning algorithms from the [h2o](https://cran.r-project.org/web/packages/h2o/index.html) R package.   
+
+There is a placeholder to run an XGBoost model with Linux as this algorithm is not currently available from h2o on Windows, which is the current operating system setup.
+
+The default parameters will be used unless stated otherwise.
+
+In this exercise we will not be splitting the data, performing cross validation or parameter tuning.
+
+3.2. **MODELING**
+
+```{r setup for h2o}
+# Set classification column to factor. 
+train$target <- as.factor(train$target)
+# Set seed for reproduceability
+set.seed(123)
+h2o.init(port = 54321,nthreads = -1) # from http://localhost:54321/flow/index.html
+# Transfer data to h2o using the as.h2o function
+train.hex = as.h2o(train,  destination_frame ="train")
+# Create a y variable with the outcome or dependent target
+y = "target"
+# We have already removed the id variable so the remaining variables will be the independent variables
+x = colnames(train.hex[,-1])
+```
+
+3.2.1 GLM Model
+
+Create a GLM logistic model using h2o and view the results. We are using the default parameters except family = "binomial" as this is a classification. We will also set the fold_Assigment to stratify the folds, keep the CV predictions and nfolds to 5 to enable cross validation.
+
+```{r glm}
+# Glm logistic model using h2o
+set.seed(123) # to ensure results are reproducable
+system.time(glm <- h2o.glm(x=x, 
+              y=y, 
+              training_frame=train.hex,
+              nfolds=5,# Defaults to 0
+              keep_cross_validation_predictions=TRUE, # Defaults to FALSE
+              fold_assignment = "Stratified", # Defaults to AUTO
+              family="binomial" # Defaults to gaussian.
+            )
+            )
+# Let's take a look at the results of the glm model
+h2o.performance(glm)
+h2o.varimp(glm)
+h2o.std_coef_plot(glm,num_of_features = 15)
+# plot(glm,timestep="number_of_trees",metric="auc") #for GLM, metric must be one of: log_likelihood, objective
+```
+3.2.2 Random Forest Model
+
+Create a random forest model using h2o using the default parameters except for number of trees 25 and max_depth of 10, these two default parameters do not run with current memory. We will also set the fold_Assigment to stratify the folds, keep the CV predictions and nfolds to 5 to enable cross validation.
+
+```{r randomforest}
+set.seed(123) # to ensure results are reproducable
+# Create a randomforest model using h2o
+system.time(forest <- h2o.randomForest(x=x, 
+                  y=y, 
+                  training_frame=train.hex,
+                  nfolds = 5, # Defaults to 0 which disables the CV
+                  max_depth=10, # Defaults to 20
+                  ntrees=25, # Defaults to 50
+                  keep_cross_validation_predictions=TRUE, # Defaults to FALSE
+                  fold_assignment="Stratified", # The 'Stratified' option will stratify the folds based on the response variable, for classification problems Defaults to AUTO
+                  seed = 123))
+            
+# Let's take a look at the results of the gbm model
+h2o.performance(forest)
+h2o.varimp(forest)
+h2o.varimp_plot(forest,num_of_features = 15)
+plot(forest,timestep="number_of_trees",metric="RMSE")
+plot(forest,timestep="number_of_trees",metric="AUC")
+# plot(forest,timestep="number_of_trees",metric="giniCoef") # metric for H2OBinomialModel must be one of: logloss, auc, classification_error, rmse
+```
+3.2.3. GBM Model
+
+Train a GBM model using h2o using the default parameters except for number of trees 100 so that we can see the decreasing RMSE metric on the plot. We will also set the distribution to bernoulli and nfolds to 5 to enable cross validation, with fold assignment to stratified.
+
+```{r gbm}
+set.seed(123) # to ensure results are reproducable
+# Train and cross validate a gbm model using h2o
+system.time(gbm <- h2o.gbm(x=x, 
+              y=y, 
+              training_frame=train.hex,
+              nfolds = 5,# Defaults to 0 which disables the CV
+              distribution = "bernoulli",
+              ntrees = 100, # Defaults to 50 
+              max_depth = 5, # Defaults to 5
+              min_rows = 10, # Deaults to 10
+              learn_rate = 0.01, # Defaults to 0.1
+              keep_cross_validation_predictions=TRUE, # Defaults to FALSE
+              fold_assignment="Stratified", # The 'Stratified' option will stratify the folds based on the response variable, for classification problems. Defaults to AUTO
+              seed = 123)
+              )
+# Let's take a look at the results of the gbm model
+h2o.performance(gbm)
+h2o.varimp(gbm)
+h2o.varimp_plot(gbm,num_of_features = 15)
+plot(gbm,timestep="number_of_trees",metric="RMSE")
+plot(gbm,timestep="number_of_trees",metric="AUC")
+# plot(gbm,timestep="number_of_trees",metric="Gini")
+```
+
+3.2.4. Deep Learning Neural Network
+
+Train a deep learning neural network model using h2o using the default parameters except for  nfolds to 5 to enable cross validation, with fold assignment to stratified.
+
+```{r deeplearing}
+set.seed(123) # to ensure results are reproducable
+system.time(deep <- h2o.deeplearning(x = x,  # column numbers for predictors
+                  y = y,   # column name for label
+                  training_frame = train.hex, # data in H2O format
+                  nfolds = 5, # Defaults to 0 which disables the CV
+                  fold_assignment = "Stratified",# The 'Stratified' option will stratify the folds based on the response variable, for classification problems. Defaults to AUTO
+                  activation = "Rectifier" ) # the activation function. Defaults to Rectifier.
+                  )
+h2o.performance(deep)
+h2o.varimp(deep)
+h2o.varimp_plot(deep,num_of_features = 15)
+plot(deep,timestep="epochs",metric="RMSE")
+plot(deep,timestep="epochs",metric="AUC")
+# plot(deep,timestep="epochs",metric="Gini") #metric for H2OBinomialModel must be one of: logloss, auc, classification_error, rmse
+```
+3.2.5. XGBoost
+
+Create a XGBoost model using h2o using the default parameters except for number of trees 100 so that we can see the decreasing RMSE metric on the plot. We will also set the distribution to bernoulli and nfolds to 5 to enable cross validation.
+
+```{r xgboost}
+# Create a xgboost model using h2o. Currently not supported on Windows. To try on Linux
+# system.time(xgboost <- h2o.xgboost(x=x, 
+#              y=y, 
+#              training_frame=train.hex,
+#              nfolds = 5,# Defaults to 0 which disables the CV
+#              distribution = "bernoulli",
+#              ntrees = 100, # Defaults to 50 
+#              max_depth = 5, # Defaults to 5
+#              min_rows = 10, # Deaults to 10
+#              learn_rate = 0.01, # Defaults to 0.1
+#              keep_cross_validation_predictions=TRUE, # Defaults to FALSE
+#              fold_assignment="Stratified", # The 'Stratified' option will stratify the folds based on the response variable, for classification problems Defaults to AUTO
+#              seed = 123)
+#              )
+# Let's take a look at the results of the gbm model
+# h2o.performance(xgboost)
+# h2o.varimp(xgboost)
+# plot(xgboost,timestep="number_of_trees",metric="RMSE")
+# plot(xgboost,timestep="number_of_trees",metric="AUC")
+```
+3.2.6. Ensemble Model
+
+```{r ensemble}
+basemodels <- list(glm, gbm,forest)
+
+system.time(ensemble <- h2o.stackedEnsemble(x = x, 
+                  y = y, 
+                  training_frame = train.hex,
+                  base_models = basemodels)
+)
+# Let's take a look at the results of the ensemble model. Note this model does not have variable importances.
+h2o.performance(ensemble)
+```
+
+## Part 4: Summary of Model Results
+
+
+As mentioned previously these models used default parameters unless specified, with imputation of means for the missing values but no further feature engineering.
+
+With this in mind, let's compare the models by in-sample RMSE, AUC, Gini coefficients and elapsed system time.
+
+```{r}
+# Plot the model RMSE
+rmse_models<- c(h2o.rmse(glm),h2o.rmse(forest),h2o.rmse(gbm),h2o.rmse(deep),NA,h2o.rmse(ensemble))
+names(rmse_models)<- c("glm","forest","gbm","deep","xgboost","ensemble")
+barplot(sort(rmse_models,decreasing = TRUE),main = "Comparison of Model RMSE")
+# Plot the model AUCs
+auc_models<- c(h2o.auc(glm),h2o.auc(forest),h2o.auc(gbm),h2o.auc(deep),NA,h2o.auc(ensemble))
+names(auc_models)<- c("glm","forest","gbm","deep","xgboost","ensemble")
+barplot(sort(auc_models,decreasing = TRUE),main = "Comparison of Model AUCs")
+#Plot the model Ginis
+gini_models<- c(h2o.giniCoef(glm),h2o.giniCoef(forest),h2o.giniCoef(gbm),h2o.giniCoef(deep),NA,h2o.giniCoef(ensemble))
+names(gini_models)<- c("glm","forest","gbm","deep","xgboost","ensemble")
+barplot(sort(gini_models,decreasing = TRUE),main = "Comparison of Model Gini Coefficients")
+# Plot system time
+systime_models<- c(75.47,428.03,1833.86,4775.39,0,26.2)
+names(systime_models)<- c("glm","forest","gbm","deep","xgboost","ensemble")
+barplot(sort(systime_models),main = "Comparison of Model Elapsed Time")
+```
+
+It appears the best performing model in the training is the ensemble, although this model is dependent  on the base models glm, gbm and forest running first so the true system time will be a sum of these and the ensemble time.
+
+Surprisingly the deep learning model takes significantly longer to run and the worst performing in the training.
+
+
+## Part 5: Predictions
+
+We will use the ensemble model to make a submission to Kaggle bearing in mind its limitations and that it is likely an overfitted model.
+
+```{r predictions test}
+# Convert the test file to a test.hex
+test.hex = as.h2o(test)
+
+# Make predictions 
+preds = as.data.frame(h2o.predict(ensemble, test.hex))
+```
+
+```{r subfile}
+# Create Kaggle Submission File
+my_solution <- data.frame(id = test$id, target = preds$predict)
+my_solution$id <- as.integer(my_solution$id)
+# Write solution to file portoglmh20.csv
+fwrite(my_solution, "portoEnsembleh20.csv", row.names = F)
+```
+
