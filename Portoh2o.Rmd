@@ -2,7 +2,7 @@
 ---
 title: "Porto Seguro's Safe Driver Prediction using H20"
 author: "Prepared by : kimnewzealand"
-date: "Date : 9 November 2017"
+date: "Date : 13 November 2017"
 output:
   html_notebook
 ---
@@ -95,49 +95,43 @@ Next we will extract and view the variables that have value -1, which represent 
 With dplyr we can call functions from different R packages directly inside the dplyr functions. We will use the [stringr](https://cran.r-project.org/web/packages/stringr/vignettes/stringr.html) R package with dplyr to view a summary of the -1's. Then we will then use the [anchors](https://cran.r-project.org/web/packages/anchors/index.html) R package with the replace.value function to impute the -1's with the column means.
 
 ```{r recode,warnings=FALSE}
-# Use the base summary function for result summaries not dplyr. This will provide us with the ranges of the variables including the minimums
+# Use the base summary function for result summaries not dplyr. This will provide us with the ranges of the variables including the minimum values
 s <- summary(train)  
-#  Extract and view the min values that have -1 from the summary we just created use str_detect from stringr package. 
+# Extract and view the min values that have -1 from the summary we just created use str_detect from stringr package. 
 s %>% 
       data.frame() %>% 
       filter(str_detect(Freq,"-1")) %>% 
       filter(str_detect(Freq,"Min")) %>%
       dplyr::select(-1)
 
-# Replace the -1 ie missing values in with NAs 
+# Replace the -1 ie missing values in the numeric columns with the mean of the respective column using recode, first replacing the -1 with NAs otherwise the -1 will distort the calculated mean
+
 # Find the index of the columns names that contain cat
 indx <- grepl('cat', colnames(train))
 # First convert the categorical columnds to NA
 train <- replace.value( train, colnames(train)[indx], from=-1, to=NA, verbose = FALSE)
-
+# Sanity check, calculate the means of sample columns before replacement
+round(mean(train$ps_car_03_cat,na.rm = TRUE)) #-1,-1,-1,0,-1
+round(mean(train$ps_car_05_cat,na.rm = TRUE)) #1,-1,-1,1
+# Create the columns mean functions for categorical means
+roundmean <- function(x) {replace(x, is.na(x), round(mean(x, na.rm = TRUE))) } 
+# Replace the NAs with the roundmean
+train <- as.data.frame(apply(train, 2, roundmean))
+# Sanity check against the above means
+train$ps_car_03_cat[2]
+train$ps_car_05_cat[2]
 # Next convert the numerical columns to NA
 train <- replace.value( train, colnames(train)[-indx], from=-1, to=NA, verbose = FALSE)
-
+# Sanity check this is same mean as calculated above before recoding
+mean(train$ps_reg_03,na.rm = TRUE) # row 3
+# Create the columns mean functions , one for mean of the continuous numerical columns
+justmean <- function(x) {replace(x, is.na(x), mean(x, na.rm = TRUE)) }
+# Replace the NAs with the justmean
+train <- as.data.frame(apply(train, 2, justmean))
+# Sanity check this is same mean as calculated above before recoding
+train$ps_reg_03[3]
 # Sanity check that we have cleaned up all -1's, the result should be empty
-colsum <- colSums(train=="-1",na.rm = TRUE) 
-colsum[colsum>0]
-```
-
-```{r testsummary}
-s_test <- summary(test)  
-#  Extract and view the min values that have -1 from the summary we just created use str_detect from stringr package. 
-s_test %>% 
-      data.frame() %>% 
-      filter(str_detect(Freq,"-1")) %>% 
-      filter(str_detect(Freq,"Min")) %>%
-      dplyr::select(-1)
-
-# Replace the -1 ie missing values in with NAs 
-# Find the index of the columns names that contain cat
-indx <- grepl('cat', colnames(test))
-# First convert the categorical columnds to NA
-test <- replace.value( test, colnames(test)[indx], from=-1, to=NA, verbose = FALSE)
-
-# Next convert the numerical columns to NA
-test <- replace.value( test, colnames(test)[-indx], from=-1, to=NA, verbose = FALSE)
-
-# Sanity check that we have cleaned up all -1's, the result should be empty
-colsum <- colSums(test=="-1",na.rm=TRUE) 
+colsum <- colSums(train=="-1") 
 colsum[colsum>0]
 ```
 
@@ -346,15 +340,20 @@ We will use the ensemble model to make a submission to Kaggle bearing in mind it
 # Convert the test file to a test.hex
 test.hex = as.h2o(test)
 
-# Make predictions 
+# Make predictions, Returns an H2OFrame object with probabilites and default predictions.
 preds = as.data.frame(h2o.predict(ensemble, test.hex))
+head(preds)
 ```
 
 ```{r subfile}
 # Create Kaggle Submission File
-my_solution <- data.frame(id = test$id, target = preds$predict)
+my_solution <- data.frame(id = test$id, target = preds$p1)
 my_solution$id <- as.integer(my_solution$id)
+head(my_solution)
+# Check the size of the prediction file is 892,816
+nrow(my_solution)
 # Write solution to file portoglmh20.csv
-fwrite(my_solution, "portoEnsembleh20.csv", row.names = F)
-```
+my_solution %>% write_csv('portoEnsembleh20.csv')
 
+```
+The Kaggle submission on the 13/11/17 scored 0.236, with highest score 0.291.
